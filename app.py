@@ -34,6 +34,7 @@ class AppConfig:
     roi: Optional[Box] = None
     absence_seconds: float = 4.0
     phone_alert_seconds: float = 60.0
+    analysis_interval_seconds: float = 3.0
     confidence: float = 0.35
     phone_confidence: float = 0.55
     phone_min_area_ratio: float = 0.0005
@@ -77,6 +78,7 @@ def load_config() -> AppConfig:
         roi=roi,
         absence_seconds=float(data.get("absence_seconds", 4.0)),
         phone_alert_seconds=float(data.get("phone_alert_seconds", 60.0)),
+        analysis_interval_seconds=float(data.get("analysis_interval_seconds", 3.0)),
         confidence=float(data.get("confidence", 0.35)),
         phone_confidence=phone_confidence,
         phone_min_area_ratio=float(data.get("phone_min_area_ratio", 0.0005)),
@@ -99,6 +101,7 @@ def save_config(config: AppConfig) -> None:
                 "roi": list(config.roi) if config.roi else None,
                 "absence_seconds": config.absence_seconds,
                 "phone_alert_seconds": config.phone_alert_seconds,
+                "analysis_interval_seconds": config.analysis_interval_seconds,
                 "confidence": config.confidence,
                 "phone_confidence": config.phone_confidence,
                 "phone_min_area_ratio": config.phone_min_area_ratio,
@@ -389,7 +392,14 @@ def run(camera_index: int) -> None:
 
     last_seen_at = time.monotonic()
     phone_first_seen_at: Optional[float] = None
-    phone_seen_until = 0.0
+    phone_last_seen_at: Optional[float] = None
+    next_analysis_at = 0.0
+    last_analysis_at = 0.0
+    people: List[Detection] = []
+    phone_candidates: List[Detection] = []
+    people_in_roi: List[Detection] = []
+    confirmed_phones: List[Detection] = []
+    poses: List[PoseDetection] = []
 
     cv2.namedWindow("Workplace monitor", cv2.WINDOW_NORMAL)
 
@@ -400,37 +410,43 @@ def run(camera_index: int) -> None:
 
         frame = cv2.flip(frame, 1)
         height, width = frame.shape[:2]
-        detections = detect(model, frame, config)
-        poses = detect_poses(pose_model, frame, config)
-
-        people = [d for d in detections if d.label == PERSON_CLASS]
-        phone_candidates = [d for d in detections if d.label == PHONE_CLASS]
         workplace = config.roi or (0, 0, width, height)
-
-        people_in_roi = [person for person in people if point_in_box(box_center(person.box), workplace)]
-        present = bool(people_in_roi)
-        confirmed_phones = filter_confirmed_phones(
-            phone_candidates,
-            people_in_roi,
-            poses,
-            workplace,
-            width,
-            height,
-            config,
-        )
-
         now = time.monotonic()
-        if present:
-            last_seen_at = now
 
-        if confirmed_phones:
-            phone_seen_until = now + 1.5
+        if now >= next_analysis_at:
+            detections = detect(model, frame, config)
+            poses = detect_poses(pose_model, frame, config)
 
-        phone_detected = now < phone_seen_until
-        if phone_detected:
-            if phone_first_seen_at is None:
-                phone_first_seen_at = now
-        else:
+            people = [d for d in detections if d.label == PERSON_CLASS]
+            phone_candidates = [d for d in detections if d.label == PHONE_CLASS]
+            people_in_roi = [person for person in people if point_in_box(box_center(person.box), workplace)]
+            confirmed_phones = filter_confirmed_phones(
+                phone_candidates,
+                people_in_roi,
+                poses,
+                workplace,
+                width,
+                height,
+                config,
+            )
+
+            if people_in_roi:
+                last_seen_at = now
+
+            if confirmed_phones:
+                phone_last_seen_at = now
+                if phone_first_seen_at is None:
+                    phone_first_seen_at = now
+            else:
+                phone_first_seen_at = None
+                phone_last_seen_at = None
+
+            last_analysis_at = now
+            next_analysis_at = now + max(0.1, config.analysis_interval_seconds)
+
+        present = bool(people_in_roi)
+        phone_detected = phone_last_seen_at is not None and bool(confirmed_phones)
+        if not phone_detected:
             phone_first_seen_at = None
 
         phone_elapsed = now - phone_first_seen_at if phone_first_seen_at is not None else 0.0
@@ -458,6 +474,7 @@ def run(camera_index: int) -> None:
             draw_label(frame, f"{label} {phone.confidence:.2f}", (phone.box[0], max(24, phone.box[1] - 8)), color)
 
         draw_status_panel(frame, present, phone_detected, phone_alert, absence_elapsed, phone_elapsed, config)
+        draw_label(frame, f"analysis every {config.analysis_interval_seconds:.1f}s | last {now - last_analysis_at:.1f}s ago", (18, height - 48), (235, 235, 235))
         draw_label(frame, "r: set zone  s: save  q/Esc: quit", (18, height - 18), (235, 235, 235))
 
         cv2.imshow("Workplace monitor", frame)
