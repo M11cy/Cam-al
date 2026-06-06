@@ -1,46 +1,67 @@
-# Local Mac Camera Workplace Monitor
+# Мониторинг рабочего места через камеру
 
-This prototype connects to your Mac camera and tracks:
+Локальный Python-прототип для камеры Mac. Приложение подключается к видеопотоку, отслеживает сотрудника в выбранной рабочей зоне и показывает тревоги, если сотрудника нет на месте или если он долго смотрит в телефон.
 
-- whether an employee is present in the selected work zone;
-- whether the employee has been absent longer than the configured limit;
-- whether a phone is visible near the employee;
-- whether a phone has remained visible for more than 60 seconds.
+## Что умеет
 
-The app uses stricter confirmation rules for phones to reduce false positives
-from similar objects such as combs, vapes, cans, and small packages. Gray boxes
-are ignored phone candidates. Red boxes are confirmed phones that start the
-alert timer.
+- определяет, находится ли сотрудник в рабочей зоне;
+- запускает тревогу, если сотрудник отсутствует дольше заданного времени;
+- ищет телефон рядом с рукой сотрудника;
+- оценивает позу сотрудника через pose-модель;
+- учитывает наклон головы вниз как дополнительный признак того, что человек “залип”;
+- запускает тревогу, если подтверждённый телефон виден дольше 60 секунд.
 
-## Run
+Приложение использует две модели YOLO:
+
+- `yolov8n.pt` - поиск человека и телефона;
+- `yolov8n-pose.pt` - определение ключевых точек тела: голова, плечи, локти, запястья.
+
+Серые рамки на видео означают неподтверждённые кандидаты на телефон. Красная рамка `phone in hand` означает, что объект прошёл фильтры и запускает таймер тревоги.
+
+## Запуск
 
 ```bash
 ./run.sh
 ```
 
-If the camera does not open, try another camera index:
+Если камера не открылась, попробуйте другой индекс:
 
 ```bash
 ./run.sh --camera 1
 ```
 
-## Controls
+На macOS может потребоваться разрешить Terminal/Python доступ к камере:
 
-- `r` - select the work zone with the mouse;
-- `s` - save the current zone to `config.json`;
-- `q` or `Esc` - quit.
+```text
+System Settings -> Privacy & Security -> Camera
+```
 
-On macOS, you may need to allow Terminal/Python camera access in
-`System Settings -> Privacy & Security -> Camera`.
+## Управление
 
-## Configuration
+- `r` - выбрать рабочую зону мышкой;
+- `s` - сохранить текущую зону в `config.json`;
+- `q` или `Esc` - выйти.
 
-After pressing `s`, the app writes `config.json`. You can edit:
+## Настройки
 
-- `absence_seconds` - seconds before employee absence alert;
-- `phone_alert_seconds` - seconds before phone alert, default `60`;
-- `confidence` - person detection confidence;
-- `phone_confidence` - phone detection confidence.
-- `phone_min_area_ratio` / `phone_max_area_ratio` - accepted phone box size;
-- `phone_min_aspect_ratio` / `phone_max_aspect_ratio` - accepted phone box shape;
-- `phone_person_zone_scale` - how close the phone must be to the employee.
+После нажатия `s` приложение сохраняет `config.json`. В нём можно менять:
+
+- `absence_seconds` - через сколько секунд отсутствия сотрудника включать тревогу;
+- `phone_alert_seconds` - через сколько секунд видимого телефона включать тревогу, по умолчанию `60`;
+- `confidence` - порог уверенности для человека;
+- `phone_confidence` - порог уверенности для телефона;
+- `phone_min_area_ratio` / `phone_max_area_ratio` - допустимый размер рамки телефона;
+- `phone_min_aspect_ratio` / `phone_max_aspect_ratio` - допустимая форма рамки телефона;
+- `phone_person_zone_scale` - насколько близко телефон должен быть к сотруднику;
+- `keypoint_confidence` - порог уверенности для точек тела;
+- `head_down_ratio` - чувствительность определения наклона головы вниз;
+- `phone_hand_distance_ratio` - насколько близко телефон должен быть к запястью или локтю;
+- `require_head_down_for_phone` - требовать наклон головы вниз для подтверждения телефона;
+- `require_phone_near_hand` - требовать телефон рядом с рукой для подтверждения телефона.
+
+## Недоработки
+
+- Модель иногда определяет как телефон похожие небольшие предметы: расчёску, вейп, банку или упаковку. При этом человек явно не будет долго смотреть на такие предметы, поэтому сейчас ложные срабатывания частично отсекаются таймером, проверкой положения руки и наклоном головы.
+- Для высокой точности в реальном магазине модель лучше дообучить на кадрах именно с этой камеры и с реальными предметами на рабочем месте.
+- Если камера стоит далеко или под неудобным углом, pose-модель может хуже видеть кисти, локти и наклон головы.
+- Текущая версия не сохраняет историю тревог и не отправляет уведомления, а только показывает статус в окне.

@@ -12,8 +12,18 @@ from ultralytics import YOLO
 
 CONFIG_PATH = Path("config.json")
 MODEL_NAME = "yolov8n.pt"
+POSE_MODEL_NAME = "yolov8n-pose.pt"
 PERSON_CLASS = "person"
 PHONE_CLASS = "cell phone"
+NOSE = 0
+LEFT_EYE = 1
+RIGHT_EYE = 2
+LEFT_SHOULDER = 5
+RIGHT_SHOULDER = 6
+LEFT_ELBOW = 7
+RIGHT_ELBOW = 8
+LEFT_WRIST = 9
+RIGHT_WRIST = 10
 
 
 Box = Tuple[int, int, int, int]
@@ -31,6 +41,11 @@ class AppConfig:
     phone_min_aspect_ratio: float = 0.35
     phone_max_aspect_ratio: float = 2.9
     phone_person_zone_scale: float = 1.55
+    keypoint_confidence: float = 0.25
+    head_down_ratio: float = 0.045
+    phone_hand_distance_ratio: float = 0.24
+    require_head_down_for_phone: bool = True
+    require_phone_near_hand: bool = True
 
 
 @dataclass
@@ -38,6 +53,14 @@ class Detection:
     label: str
     confidence: float
     box: Box
+
+
+@dataclass
+class PoseDetection:
+    confidence: float
+    box: Box
+    keypoints: np.ndarray
+    keypoint_confidences: np.ndarray
 
 
 def load_config() -> AppConfig:
@@ -61,6 +84,11 @@ def load_config() -> AppConfig:
         phone_min_aspect_ratio=float(data.get("phone_min_aspect_ratio", 0.35)),
         phone_max_aspect_ratio=float(data.get("phone_max_aspect_ratio", 2.9)),
         phone_person_zone_scale=float(data.get("phone_person_zone_scale", 1.55)),
+        keypoint_confidence=float(data.get("keypoint_confidence", 0.25)),
+        head_down_ratio=float(data.get("head_down_ratio", 0.045)),
+        phone_hand_distance_ratio=float(data.get("phone_hand_distance_ratio", 0.24)),
+        require_head_down_for_phone=bool(data.get("require_head_down_for_phone", True)),
+        require_phone_near_hand=bool(data.get("require_phone_near_hand", True)),
     )
 
 
@@ -78,6 +106,11 @@ def save_config(config: AppConfig) -> None:
                 "phone_min_aspect_ratio": config.phone_min_aspect_ratio,
                 "phone_max_aspect_ratio": config.phone_max_aspect_ratio,
                 "phone_person_zone_scale": config.phone_person_zone_scale,
+                "keypoint_confidence": config.keypoint_confidence,
+                "head_down_ratio": config.head_down_ratio,
+                "phone_hand_distance_ratio": config.phone_hand_distance_ratio,
+                "require_head_down_for_phone": config.require_head_down_for_phone,
+                "require_phone_near_hand": config.require_phone_near_hand,
             },
             ensure_ascii=False,
             indent=2,
@@ -94,6 +127,22 @@ def box_center(box: Box) -> Tuple[int, int]:
 def box_area(box: Box) -> int:
     x1, y1, x2, y2 = box
     return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def box_iou(first: Box, second: Box) -> float:
+    ax1, ay1, ax2, ay2 = first
+    bx1, by1, bx2, by2 = second
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    intersection = box_area((ix1, iy1, ix2, iy2))
+    union = box_area(first) + box_area(second) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def distance(first: Tuple[int, int], second: Tuple[int, int]) -> float:
+    return float(np.hypot(first[0] - second[0], first[1] - second[1]))
 
 
 def point_in_box(point: Tuple[int, int], box: Box) -> bool:
@@ -129,9 +178,65 @@ def is_phone_like_shape(phone: Detection, frame_width: int, frame_height: int, c
     )
 
 
+def keypoint(pose: PoseDetection, index: int, config: AppConfig) -> Optional[Tuple[int, int]]:
+    if pose.keypoint_confidences[index] < config.keypoint_confidence:
+        return None
+    x, y = pose.keypoints[index]
+    return int(x), int(y)
+
+
+def keypoints_for(pose: PoseDetection, indexes: List[int], config: AppConfig) -> List[Tuple[int, int]]:
+    points: List[Tuple[int, int]] = []
+    for index in indexes:
+        point = keypoint(pose, index, config)
+        if point:
+            points.append(point)
+    return points
+
+
+def is_head_down(pose: PoseDetection, config: AppConfig) -> bool:
+    nose = keypoint(pose, NOSE, config)
+    eyes = keypoints_for(pose, [LEFT_EYE, RIGHT_EYE], config)
+    shoulders = keypoints_for(pose, [LEFT_SHOULDER, RIGHT_SHOULDER], config)
+    person_height = max(1, pose.box[3] - pose.box[1])
+
+    if nose and eyes:
+        eye_y = sum(point[1] for point in eyes) / len(eyes)
+        return (nose[1] - eye_y) / person_height >= config.head_down_ratio
+
+    if nose and shoulders:
+        shoulder_y = sum(point[1] for point in shoulders) / len(shoulders)
+        return (shoulder_y - nose[1]) / person_height < 0.33
+
+    return False
+
+
+def is_phone_near_hand(phone: Detection, pose: PoseDetection, config: AppConfig) -> bool:
+    hand_points = keypoints_for(pose, [LEFT_WRIST, RIGHT_WRIST, LEFT_ELBOW, RIGHT_ELBOW], config)
+    if not hand_points:
+        return False
+
+    phone_center = box_center(phone.box)
+    person_height = max(1, pose.box[3] - pose.box[1])
+    max_distance = person_height * config.phone_hand_distance_ratio
+    return any(distance(phone_center, point) <= max_distance for point in hand_points)
+
+
+def find_matching_pose(person: Detection, poses: List[PoseDetection]) -> Optional[PoseDetection]:
+    best_pose: Optional[PoseDetection] = None
+    best_iou = 0.0
+    for pose in poses:
+        iou = box_iou(person.box, pose.box)
+        if iou > best_iou:
+            best_iou = iou
+            best_pose = pose
+    return best_pose if best_iou >= 0.2 else None
+
+
 def filter_confirmed_phones(
     phones: List[Detection],
     people_in_roi: List[Detection],
+    poses: List[PoseDetection],
     workplace: Box,
     frame_width: int,
     frame_height: int,
@@ -146,8 +251,19 @@ def filter_confirmed_phones(
             continue
 
         for person in people_in_roi:
+            pose = find_matching_pose(person, poses)
+            if not pose:
+                continue
+
             person_zone = expand_box(person.box, frame_width, frame_height, scale=config.phone_person_zone_scale)
             if point_in_box(phone_center, person_zone):
+                phone_near_hand = is_phone_near_hand(phone, pose, config)
+                head_down = is_head_down(pose, config)
+                if config.require_phone_near_hand and not phone_near_hand:
+                    continue
+                if config.require_head_down_for_phone and not head_down:
+                    continue
+
                 confirmed.append(phone)
                 break
 
@@ -180,10 +296,41 @@ def detect(model: YOLO, frame: np.ndarray, config: AppConfig) -> List[Detection]
     return detections
 
 
+def detect_poses(model: YOLO, frame: np.ndarray, config: AppConfig) -> List[PoseDetection]:
+    result = model.predict(frame, conf=config.confidence, verbose=False)[0]
+    if result.keypoints is None:
+        return []
+
+    keypoints = result.keypoints.xy.cpu().numpy()
+    keypoint_confidences = result.keypoints.conf.cpu().numpy()
+    poses: List[PoseDetection] = []
+
+    for index, item in enumerate(result.boxes):
+        confidence = float(item.conf[0])
+        x1, y1, x2, y2 = item.xyxy[0].tolist()
+        poses.append(
+            PoseDetection(
+                confidence=confidence,
+                box=(int(x1), int(y1), int(x2), int(y2)),
+                keypoints=keypoints[index],
+                keypoint_confidences=keypoint_confidences[index],
+            )
+        )
+
+    return poses
+
+
 def draw_label(frame: np.ndarray, text: str, origin: Tuple[int, int], color: Tuple[int, int, int]) -> None:
     x, y = origin
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2, cv2.LINE_AA)
+
+
+def draw_pose_points(frame: np.ndarray, pose: PoseDetection, config: AppConfig) -> None:
+    for index in [NOSE, LEFT_EYE, RIGHT_EYE, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]:
+        point = keypoint(pose, index, config)
+        if point:
+            cv2.circle(frame, point, 4, (255, 210, 80), -1)
 
 
 def draw_status_panel(
@@ -234,6 +381,7 @@ def select_roi(frame: np.ndarray) -> Optional[Box]:
 def run(camera_index: int) -> None:
     config = load_config()
     model = YOLO(MODEL_NAME)
+    pose_model = YOLO(POSE_MODEL_NAME)
     capture = cv2.VideoCapture(camera_index)
 
     if not capture.isOpened():
@@ -253,6 +401,7 @@ def run(camera_index: int) -> None:
         frame = cv2.flip(frame, 1)
         height, width = frame.shape[:2]
         detections = detect(model, frame, config)
+        poses = detect_poses(pose_model, frame, config)
 
         people = [d for d in detections if d.label == PERSON_CLASS]
         phone_candidates = [d for d in detections if d.label == PHONE_CLASS]
@@ -263,6 +412,7 @@ def run(camera_index: int) -> None:
         confirmed_phones = filter_confirmed_phones(
             phone_candidates,
             people_in_roi,
+            poses,
             workplace,
             width,
             height,
@@ -292,13 +442,18 @@ def run(camera_index: int) -> None:
 
         for person in people:
             color = (80, 220, 120) if person in people_in_roi else (170, 170, 170)
+            pose = find_matching_pose(person, poses)
             cv2.rectangle(frame, person.box[:2], person.box[2:], color, 2)
             draw_label(frame, f"person {person.confidence:.2f}", (person.box[0], max(24, person.box[1] - 8)), color)
+            if pose:
+                draw_pose_points(frame, pose, config)
+                posture = "head down" if is_head_down(pose, config) else "head up"
+                draw_label(frame, posture, (person.box[0], min(height - 24, person.box[3] + 24)), (255, 210, 80))
 
         for phone in phone_candidates:
             confirmed = phone in confirmed_phones
             color = (60, 80, 255) if confirmed else (150, 150, 150)
-            label = "phone" if confirmed else "ignored phone candidate"
+            label = "phone in hand" if confirmed else "ignored phone candidate"
             cv2.rectangle(frame, phone.box[:2], phone.box[2:], color, 2)
             draw_label(frame, f"{label} {phone.confidence:.2f}", (phone.box[0], max(24, phone.box[1] - 8)), color)
 
