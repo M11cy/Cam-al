@@ -7,6 +7,8 @@ config.json
 runs/
 models/
 dataset/raw/
+dataset/images_draft/
+dataset/labels_draft/
 dataset/images/
 dataset/labels/
 .env

@@ -43,10 +43,40 @@ def yolo_line(box: Box, width: int, height: int) -> str:
     return f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
 
 
+def box_from_yolo_line(line: str, width: int, height: int) -> Optional[Box]:
+    parts = line.strip().split()
+    if len(parts) != 5:
+        return None
+
+    try:
+        class_id = int(parts[0])
+        cx, cy, bw, bh = (float(value) for value in parts[1:])
+    except ValueError:
+        return None
+
+    if class_id not in COLORS:
+        return None
+
+    box_width = bw * width
+    box_height = bh * height
+    center_x = cx * width
+    center_y = cy * height
+    x1 = int(round(center_x - box_width / 2))
+    y1 = int(round(center_y - box_height / 2))
+    x2 = int(round(center_x + box_width / 2))
+    y2 = int(round(center_y + box_height / 2))
+    return normalize_box(class_id, (x1, y1), (x2, y2), width, height)
+
+
 def split_for(path: Path, val_ratio: float) -> str:
     digest = hashlib.sha1(path.name.encode("utf-8")).hexdigest()
     value = int(digest[:8], 16) / 0xFFFFFFFF
     return "val" if value < val_ratio else "train"
+
+
+def label_path_for(image_path: Path, labels_dir: Path, val_ratio: float) -> Path:
+    split = split_for(image_path, val_ratio)
+    return labels_dir / split / f"{image_path.stem}.txt"
 
 
 def normalize_box(class_id: int, start: Tuple[int, int], end: Tuple[int, int], width: int, height: int) -> Optional[Box]:
@@ -59,6 +89,20 @@ def normalize_box(class_id: int, start: Tuple[int, int], end: Tuple[int, int], w
     if right - left < 8 or bottom - top < 8:
         return None
     return class_id, left, top, right, bottom
+
+
+def load_boxes(image_path: Path, image, labels_dir: Path, val_ratio: float) -> List[Box]:
+    height, width = image.shape[:2]
+    label_path = label_path_for(image_path, labels_dir, val_ratio)
+    if not label_path.exists():
+        return []
+
+    boxes: List[Box] = []
+    for line in label_path.read_text(encoding="utf-8").splitlines():
+        box = box_from_yolo_line(line, width, height)
+        if box:
+            boxes.append(box)
+    return boxes
 
 
 def draw_boxes(image, boxes: List[Box]):
@@ -82,7 +126,7 @@ def draw_state(state: AnnotationState, image_name: str):
 
     help_text = (
         f"{image_name} | selected: {state.selected_class_name} | "
-        "drag mouse to draw | p person | t phone | o other | u undo | n save | s empty | q quit"
+        "drag mouse to draw | p person | t phone | o other | u undo | c clear | n save | s empty | q quit"
     )
     cv2.rectangle(preview, (0, 0), (preview.shape[1], 48), (24, 24, 24), -1)
     cv2.putText(preview, help_text, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
@@ -129,11 +173,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Annotate frames into YOLO labels")
     parser.add_argument("--raw", default="dataset/raw", help="Directory with captured frames")
     parser.add_argument("--dataset", default="dataset", help="Dataset directory")
+    parser.add_argument(
+        "--draft-labels",
+        default="dataset/labels_draft",
+        help="Directory with draft YOLO labels to edit before saving",
+    )
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio")
     args = parser.parse_args()
 
     raw_dir = Path(args.raw)
     dataset_dir = Path(args.dataset)
+    draft_labels_dir = Path(args.draft_labels)
     image_paths = sorted(
         path for path in raw_dir.glob("*")
         if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
@@ -146,7 +196,8 @@ def main() -> None:
     state = AnnotationState()
     cv2.setMouseCallback(window, on_mouse, state)
     print("Draw boxes by dragging the mouse.")
-    print("Keys: p=person, t=phone, o=other_object, u=undo, n=save next, s=save empty/skip, q=quit")
+    print("Existing draft labels are loaded automatically when present.")
+    print("Keys: p=person, t=phone, o=other_object, u=undo, c=clear, n=save next, s=save empty/skip, q=quit")
 
     for image_path in image_paths:
         image = cv2.imread(str(image_path))
@@ -154,10 +205,12 @@ def main() -> None:
             continue
 
         state.image = image
-        state.boxes = []
+        state.boxes = load_boxes(image_path, image, draft_labels_dir, args.val_ratio)
         state.drawing = False
         state.start = None
         state.current = None
+        if state.boxes:
+            print(f"Loaded {len(state.boxes)} draft boxes for {image_path.name}")
 
         while True:
             cv2.imshow(window, draw_state(state, image_path.name))
@@ -170,6 +223,9 @@ def main() -> None:
                 continue
             if key == ord("u") and state.boxes:
                 state.boxes.pop()
+                continue
+            if key == ord("c"):
+                state.boxes = []
                 continue
             if key == ord("n"):
                 save_annotation(image_path, image, state.boxes, dataset_dir, args.val_ratio)
