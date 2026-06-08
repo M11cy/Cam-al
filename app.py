@@ -14,7 +14,8 @@ CONFIG_PATH = Path("config.json")
 MODEL_NAME = "yolov8s.pt"
 POSE_MODEL_NAME = "yolov8n-pose.pt"
 PERSON_CLASS = "person"
-PHONE_CLASS = "cell phone"
+PHONE_CLASSES = {"cell phone", "phone"}
+DISTRACTOR_CLASSES = {"other_object", "other object", "other", "distractor"}
 NOSE = 0
 LEFT_EYE = 1
 RIGHT_EYE = 2
@@ -359,7 +360,7 @@ def detect(model: YOLO, frame: np.ndarray, config: AppConfig) -> List[Detection]
         confidence = float(item.conf[0])
         if label == PERSON_CLASS and confidence < config.confidence:
             continue
-        if label != PERSON_CLASS and label != PHONE_CLASS:
+        if label != PERSON_CLASS and label not in PHONE_CLASSES and label not in DISTRACTOR_CLASSES:
             continue
 
         x1, y1, x2, y2 = item.xyxy[0].tolist()
@@ -482,7 +483,8 @@ def run(camera_index: int) -> None:
         poses = detect_poses(pose_model, frame, config)
 
         people = [d for d in detections if d.label == PERSON_CLASS]
-        phone_candidates = [d for d in detections if d.label == PHONE_CLASS]
+        phone_candidates = [d for d in detections if d.label in PHONE_CLASSES]
+        distractors = [d for d in detections if d.label in DISTRACTOR_CLASSES]
         workplace = config.roi or (0, 0, width, height)
         people_in_roi = [person for person in people if point_in_box(box_center(person.box), workplace)]
         present = bool(people_in_roi)
@@ -542,6 +544,16 @@ def run(camera_index: int) -> None:
             )
             if not assessment.confirmed:
                 draw_label(frame, assessment.reason[:52], (phone.box[0], min(height - 24, phone.box[3] + 24)), color)
+
+        for distractor in distractors:
+            color = (120, 120, 120)
+            cv2.rectangle(frame, distractor.box[:2], distractor.box[2:], color, 2)
+            draw_label(
+                frame,
+                f"{distractor.label} {distractor.confidence:.2f}",
+                (distractor.box[0], max(24, distractor.box[1] - 8)),
+                color,
+            )
 
         draw_status_panel(frame, present, phone_detected, phone_alert, absence_elapsed, phone_elapsed, config)
         draw_label(frame, "r: set zone  s: save  q/Esc: quit", (18, height - 18), (235, 235, 235))
