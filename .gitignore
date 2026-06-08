@@ -5,6 +5,10 @@ __pycache__/
 *.pt
 config.json
 runs/
+models/
+dataset/raw/
+dataset/images/
+dataset/labels/
 .env
 .DS_Store
 .ipynb_checkpoints/
