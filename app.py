@@ -11,7 +11,7 @@ from ultralytics import YOLO
 
 
 CONFIG_PATH = Path("config.json")
-MODEL_NAME = "yolov8n.pt"
+MODEL_NAME = "yolov8s.pt"
 POSE_MODEL_NAME = "yolov8n-pose.pt"
 PERSON_CLASS = "person"
 PHONE_CLASS = "cell phone"
@@ -34,16 +34,20 @@ class AppConfig:
     roi: Optional[Box] = None
     absence_seconds: float = 4.0
     phone_alert_seconds: float = 60.0
+    inference_confidence: float = 0.15
+    object_img_size: int = 960
+    pose_img_size: int = 640
     confidence: float = 0.35
-    phone_confidence: float = 0.55
-    phone_min_area_ratio: float = 0.0005
-    phone_max_area_ratio: float = 0.04
+    phone_confidence: float = 0.35
+    phone_confirm_score: float = 0.58
+    phone_min_area_ratio: float = 0.0001
+    phone_max_area_ratio: float = 0.06
     phone_min_aspect_ratio: float = 0.35
     phone_max_aspect_ratio: float = 2.9
     phone_person_zone_scale: float = 1.55
     keypoint_confidence: float = 0.25
     head_down_ratio: float = 0.045
-    phone_hand_distance_ratio: float = 0.24
+    phone_hand_distance_ratio: float = 0.32
     require_head_down_for_phone: bool = True
     require_phone_near_hand: bool = True
 
@@ -63,24 +67,36 @@ class PoseDetection:
     keypoint_confidences: np.ndarray
 
 
+@dataclass
+class PhoneAssessment:
+    phone: Detection
+    score: float
+    confirmed: bool
+    reason: str
+
+
 def load_config() -> AppConfig:
     if not CONFIG_PATH.exists():
         return AppConfig()
 
     data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     roi = tuple(data["roi"]) if data.get("roi") else None
-    phone_confidence = float(data.get("phone_confidence", 0.55))
-    if phone_confidence == 0.25:
-        phone_confidence = 0.55
+    phone_confidence = float(data.get("phone_confidence", 0.35))
+    if phone_confidence in (0.25, 0.55):
+        phone_confidence = 0.35
 
     return AppConfig(
         roi=roi,
         absence_seconds=float(data.get("absence_seconds", 4.0)),
         phone_alert_seconds=float(data.get("phone_alert_seconds", 60.0)),
+        inference_confidence=float(data.get("inference_confidence", 0.15)),
+        object_img_size=int(data.get("object_img_size", 960)),
+        pose_img_size=int(data.get("pose_img_size", 640)),
         confidence=float(data.get("confidence", 0.35)),
         phone_confidence=phone_confidence,
-        phone_min_area_ratio=float(data.get("phone_min_area_ratio", 0.0005)),
-        phone_max_area_ratio=float(data.get("phone_max_area_ratio", 0.04)),
+        phone_confirm_score=float(data.get("phone_confirm_score", 0.58)),
+        phone_min_area_ratio=float(data.get("phone_min_area_ratio", 0.0001)),
+        phone_max_area_ratio=float(data.get("phone_max_area_ratio", 0.06)),
         phone_min_aspect_ratio=float(data.get("phone_min_aspect_ratio", 0.35)),
         phone_max_aspect_ratio=float(data.get("phone_max_aspect_ratio", 2.9)),
         phone_person_zone_scale=float(data.get("phone_person_zone_scale", 1.55)),
@@ -99,8 +115,12 @@ def save_config(config: AppConfig) -> None:
                 "roi": list(config.roi) if config.roi else None,
                 "absence_seconds": config.absence_seconds,
                 "phone_alert_seconds": config.phone_alert_seconds,
+                "inference_confidence": config.inference_confidence,
+                "object_img_size": config.object_img_size,
+                "pose_img_size": config.pose_img_size,
                 "confidence": config.confidence,
                 "phone_confidence": config.phone_confidence,
+                "phone_confirm_score": config.phone_confirm_score,
                 "phone_min_area_ratio": config.phone_min_area_ratio,
                 "phone_max_area_ratio": config.phone_max_area_ratio,
                 "phone_min_aspect_ratio": config.phone_min_aspect_ratio,
@@ -178,6 +198,22 @@ def is_phone_like_shape(phone: Detection, frame_width: int, frame_height: int, c
     )
 
 
+def phone_shape_score(phone: Detection, frame_width: int, frame_height: int, config: AppConfig) -> Tuple[float, str]:
+    x1, y1, x2, y2 = phone.box
+    box_width = max(1, x2 - x1)
+    box_height = max(1, y2 - y1)
+    area_ratio = box_area(phone.box) / max(1, frame_width * frame_height)
+    aspect_ratio = box_width / box_height
+
+    if area_ratio < config.phone_min_area_ratio:
+        return 0.0, "too small"
+    if area_ratio > config.phone_max_area_ratio:
+        return 0.0, "too large"
+    if aspect_ratio < config.phone_min_aspect_ratio or aspect_ratio > config.phone_max_aspect_ratio:
+        return 0.1, "bad shape"
+    return 0.2, "shape ok"
+
+
 def keypoint(pose: PoseDetection, index: int, config: AppConfig) -> Optional[Tuple[int, int]]:
     if pose.keypoint_confidences[index] < config.keypoint_confidence:
         return None
@@ -233,7 +269,7 @@ def find_matching_pose(person: Detection, poses: List[PoseDetection]) -> Optiona
     return best_pose if best_iou >= 0.2 else None
 
 
-def filter_confirmed_phones(
+def assess_phones(
     phones: List[Detection],
     people_in_roi: List[Detection],
     poses: List[PoseDetection],
@@ -241,37 +277,74 @@ def filter_confirmed_phones(
     frame_width: int,
     frame_height: int,
     config: AppConfig,
-) -> List[Detection]:
-    confirmed: List[Detection] = []
+) -> List[PhoneAssessment]:
+    assessments: List[PhoneAssessment] = []
     for phone in phones:
+        score = 0.0
+        reasons: List[str] = []
         phone_center = box_center(phone.box)
+
         if not point_in_box(phone_center, workplace):
-            continue
-        if not is_phone_like_shape(phone, frame_width, frame_height, config):
+            assessments.append(PhoneAssessment(phone, 0.0, False, "outside zone"))
             continue
 
+        shape_score, shape_reason = phone_shape_score(phone, frame_width, frame_height, config)
+        if shape_score == 0.0:
+            assessments.append(PhoneAssessment(phone, 0.0, False, shape_reason))
+            continue
+        score += shape_score
+        reasons.append(shape_reason)
+
+        if phone.confidence >= config.phone_confidence:
+            score += 0.25
+            reasons.append("conf ok")
+        else:
+            score += 0.1
+            reasons.append("low conf")
+
+        best_person_score = 0.0
+        best_person_reasons: List[str] = []
         for person in people_in_roi:
             pose = find_matching_pose(person, poses)
-            if not pose:
+            person_zone = expand_box(person.box, frame_width, frame_height, scale=config.phone_person_zone_scale)
+            if not point_in_box(phone_center, person_zone):
                 continue
 
-            person_zone = expand_box(person.box, frame_width, frame_height, scale=config.phone_person_zone_scale)
-            if point_in_box(phone_center, person_zone):
+            person_score = 0.15
+            person_reasons = ["near person"]
+            if pose:
                 phone_near_hand = is_phone_near_hand(phone, pose, config)
                 head_down = is_head_down(pose, config)
-                if config.require_phone_near_hand and not phone_near_hand:
-                    continue
-                if config.require_head_down_for_phone and not head_down:
-                    continue
+                if phone_near_hand:
+                    person_score += 0.25
+                    person_reasons.append("near hand")
+                elif config.require_phone_near_hand:
+                    person_score -= 0.15
+                    person_reasons.append("not near hand")
 
-                confirmed.append(phone)
-                break
+                if head_down:
+                    person_score += 0.2
+                    person_reasons.append("head down")
+                elif config.require_head_down_for_phone:
+                    person_score -= 0.1
+                    person_reasons.append("head up")
+            else:
+                person_reasons.append("no pose")
 
-    return confirmed
+            if person_score > best_person_score:
+                best_person_score = person_score
+                best_person_reasons = person_reasons
+
+        score += best_person_score
+        reasons.extend(best_person_reasons)
+        confirmed = score >= config.phone_confirm_score
+        assessments.append(PhoneAssessment(phone, score, confirmed, ", ".join(reasons) or "not near person"))
+
+    return assessments
 
 
 def detect(model: YOLO, frame: np.ndarray, config: AppConfig) -> List[Detection]:
-    result = model.predict(frame, conf=config.phone_confidence, verbose=False)[0]
+    result = model.predict(frame, conf=config.inference_confidence, imgsz=config.object_img_size, verbose=False)[0]
     names: Dict[int, str] = result.names
     detections: List[Detection] = []
 
@@ -297,7 +370,7 @@ def detect(model: YOLO, frame: np.ndarray, config: AppConfig) -> List[Detection]
 
 
 def detect_poses(model: YOLO, frame: np.ndarray, config: AppConfig) -> List[PoseDetection]:
-    result = model.predict(frame, conf=config.confidence, verbose=False)[0]
+    result = model.predict(frame, conf=config.confidence, imgsz=config.pose_img_size, verbose=False)[0]
     if result.keypoints is None:
         return []
 
@@ -409,7 +482,7 @@ def run(camera_index: int) -> None:
         people_in_roi = [person for person in people if point_in_box(box_center(person.box), workplace)]
         present = bool(people_in_roi)
 
-        confirmed_phones = filter_confirmed_phones(
+        phone_assessments = assess_phones(
             phone_candidates,
             people_in_roi,
             poses,
@@ -418,6 +491,7 @@ def run(camera_index: int) -> None:
             height,
             config,
         )
+        confirmed_phones = [assessment.phone for assessment in phone_assessments if assessment.confirmed]
 
         now = time.monotonic()
         if present:
@@ -450,12 +524,19 @@ def run(camera_index: int) -> None:
                 posture = "head down" if is_head_down(pose, config) else "head up"
                 draw_label(frame, posture, (person.box[0], min(height - 24, person.box[3] + 24)), (255, 210, 80))
 
-        for phone in phone_candidates:
-            confirmed = phone in confirmed_phones
-            color = (60, 80, 255) if confirmed else (150, 150, 150)
-            label = "phone in hand" if confirmed else "ignored phone candidate"
+        for assessment in phone_assessments:
+            phone = assessment.phone
+            color = (60, 80, 255) if assessment.confirmed else (150, 150, 150)
+            label = "phone in hand" if assessment.confirmed else "phone candidate"
             cv2.rectangle(frame, phone.box[:2], phone.box[2:], color, 2)
-            draw_label(frame, f"{label} {phone.confidence:.2f}", (phone.box[0], max(24, phone.box[1] - 8)), color)
+            draw_label(
+                frame,
+                f"{label} conf {phone.confidence:.2f} score {assessment.score:.2f}",
+                (phone.box[0], max(24, phone.box[1] - 8)),
+                color,
+            )
+            if not assessment.confirmed:
+                draw_label(frame, assessment.reason[:52], (phone.box[0], min(height - 24, phone.box[3] + 24)), color)
 
         draw_status_panel(frame, present, phone_detected, phone_alert, absence_elapsed, phone_elapsed, config)
         draw_label(frame, "r: set zone  s: save  q/Esc: quit", (18, height - 18), (235, 235, 235))
