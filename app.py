@@ -11,7 +11,8 @@ from ultralytics import YOLO
 
 
 CONFIG_PATH = Path("config.json")
-MODEL_NAME = "yolov8s.pt"
+CUSTOM_MODEL_PATH = Path("models/shop-camera-phone.pt")
+DEFAULT_MODEL_NAME = "yolov8s.pt"
 POSE_MODEL_NAME = "yolov8n-pose.pt"
 PERSON_CLASS = "person"
 PHONE_CLASSES = {"cell phone", "phone"}
@@ -459,7 +460,9 @@ def select_roi(frame: np.ndarray) -> Optional[Box]:
 
 def run(camera_index: int) -> None:
     config = load_config()
-    model = YOLO(MODEL_NAME)
+    object_model_path = str(CUSTOM_MODEL_PATH if CUSTOM_MODEL_PATH.exists() else DEFAULT_MODEL_NAME)
+    print(f"Object model: {object_model_path}")
+    model = YOLO(object_model_path)
     pose_model = YOLO(POSE_MODEL_NAME)
     capture = cv2.VideoCapture(camera_index)
 
