@@ -304,6 +304,7 @@ def assess_phones(
 
         best_person_score = 0.0
         best_person_reasons: List[str] = []
+        best_person_allowed = False
         for person in people_in_roi:
             pose = find_matching_pose(person, poses)
             person_zone = expand_box(person.box, frame_width, frame_height, scale=config.phone_person_zone_scale)
@@ -312,6 +313,7 @@ def assess_phones(
 
             person_score = 0.15
             person_reasons = ["near person"]
+            person_allowed = True
             if pose:
                 phone_near_hand = is_phone_near_hand(phone, pose, config)
                 head_down = is_head_down(pose, config)
@@ -319,25 +321,28 @@ def assess_phones(
                     person_score += 0.25
                     person_reasons.append("near hand")
                 elif config.require_phone_near_hand:
-                    person_score -= 0.15
+                    person_allowed = False
                     person_reasons.append("not near hand")
 
                 if head_down:
                     person_score += 0.2
                     person_reasons.append("head down")
                 elif config.require_head_down_for_phone:
-                    person_score -= 0.1
+                    person_allowed = False
                     person_reasons.append("head up")
             else:
+                if config.require_phone_near_hand or config.require_head_down_for_phone:
+                    person_allowed = False
                 person_reasons.append("no pose")
 
             if person_score > best_person_score:
                 best_person_score = person_score
                 best_person_reasons = person_reasons
+                best_person_allowed = person_allowed
 
         score += best_person_score
         reasons.extend(best_person_reasons)
-        confirmed = score >= config.phone_confirm_score
+        confirmed = best_person_allowed and score >= config.phone_confirm_score
         assessments.append(PhoneAssessment(phone, score, confirmed, ", ".join(reasons) or "not near person"))
 
     return assessments
